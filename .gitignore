@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Screenshots y HTML temporales
+*.png
+*.html
+
+# Chrome profiles (automatizacion)
+chrome_*/
+
+# Debug
+debug/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+
+# Credenciales (NUNCA subir)
+.env
+
+# CSV con datos personales
+*.csv
