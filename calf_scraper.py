@@ -24,6 +24,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
@@ -34,7 +35,7 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException
 env_path = Path(__file__).parent / '.env'
 load_dotenv(env_path)
 
-URL = "https://sixon.com.ar/PortalClientes_CALF_PROD/com.portalclientes.portalloginsinregistro"
+URL = "https://sixon.com.ar/PortalClientes_CALF_PROD/servlet/com.portalclientes.portalloginsinregistro"
 TIPO_ID = os.getenv("CALF_TIPO_ID", "4")   # 1=DNI, 2=CUIT, 4=SOCIO
 NRO_ID = os.getenv("CALF_NRO_ID")
 
@@ -99,7 +100,7 @@ def guardar_debug(driver, nombre: str):
 # DRIVER
 # ============================================================
 def crear_driver(headless: bool = False) -> uc.Chrome:
-    """Crea driver con undetected-chromedriver"""
+    """Crea driver con undetected-chromedriver y perfil persistente"""
     options = uc.ChromeOptions()
     if headless:
         options.add_argument("--headless")
@@ -109,7 +110,11 @@ def crear_driver(headless: bool = False) -> uc.Chrome:
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--log-level=3")
 
-    driver = uc.Chrome(options=options)
+    # Perfil persistente para mantener cookies del reCAPTCHA entre ejecuciones
+    profile_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'chrome_profile')
+    options.add_argument(f"--user-data-dir={profile_dir}")
+
+    driver = uc.Chrome(options=options, version_main=144)
     driver.implicitly_wait(10)
     return driver
 
@@ -126,6 +131,9 @@ def login(driver: uc.Chrome) -> bool:
 
     try:
         # Esperar que cargue el formulario
+        time.sleep(3)
+        print(f"[{timestamp()}] URL actual: {driver.current_url}")
+        print(f"[{timestamp()}] Titulo: {driver.title}")
         wait.until(EC.presence_of_element_located((By.ID, 'vTIPOID')))
         print(f"[{timestamp()}] Formulario cargado")
 
@@ -134,10 +142,28 @@ def login(driver: uc.Chrome) -> bool:
         tipo_select.select_by_value(TIPO_ID)
         time.sleep(0.5)
 
-        # Ingresar numero
-        nro_field = driver.find_element(By.ID, 'vNROID')
-        nro_field.clear()
-        nro_field.send_keys(NRO_ID)
+        # Ingresar numero via JavaScript (GeneXus necesita eventos especificos)
+        driver.execute_script(
+            "var el = document.getElementById('vNROID');"
+            "el.focus();"
+            "el.value = arguments[0];"
+            "el.dispatchEvent(new Event('input', {bubbles: true}));"
+            "el.dispatchEvent(new Event('change', {bubbles: true}));"
+            "el.blur();",
+            NRO_ID
+        )
+        time.sleep(0.5)
+        # Verificar
+        valor_actual = driver.find_element(By.ID, 'vNROID').get_attribute('value')
+        if valor_actual != NRO_ID:
+            # Fallback: click y tipear
+            nro_field = driver.find_element(By.ID, 'vNROID')
+            nro_field.click()
+            nro_field.send_keys(Keys.CONTROL, 'a')
+            nro_field.send_keys(NRO_ID)
+            print(f"[{timestamp()}] Numero cargado via send_keys (fallback)")
+        else:
+            print(f"[{timestamp()}] Numero cargado: {valor_actual}")
 
         tipo_nombres = {'1': 'DNI', '2': 'CUIT', '4': 'SOCIO'}
         print(f"[{timestamp()}] Tipo: {tipo_nombres.get(TIPO_ID, TIPO_ID)} | Numero: {NRO_ID}")
@@ -148,10 +174,19 @@ def login(driver: uc.Chrome) -> bool:
             guardar_debug(driver, "captcha_timeout")
             return False
 
+        # Si la pagina ya avanzo (usuario hizo login manual), no hacer click
+        page_text = driver.find_element(By.TAG_NAME, 'body').text
+        if 'Cuentas de la persona' in page_text:
+            print(f"[{timestamp()}] Login ya completado manualmente")
+            return True
+
         # Click en INICIAR SESION
-        login_btn = driver.find_element(By.ID, 'LOGIN')
-        login_btn.click()
-        print(f"[{timestamp()}] Click en INICIAR SESION...")
+        try:
+            login_btn = driver.find_element(By.ID, 'LOGIN')
+            login_btn.click()
+            print(f"[{timestamp()}] Click en INICIAR SESION...")
+        except NoSuchElementException:
+            print(f"[{timestamp()}] Boton LOGIN no encontrado, pagina puede haber avanzado")
 
         # Esperar que cargue la pagina post-login
         time.sleep(3)
@@ -177,6 +212,12 @@ def login(driver: uc.Chrome) -> bool:
 
     except TimeoutException:
         print(f"[{timestamp()}] ERROR: Timeout durante login")
+        print(f"[{timestamp()}] URL: {driver.current_url}")
+        try:
+            body = driver.find_element(By.TAG_NAME, 'body').text[:500]
+            print(f"[{timestamp()}] Body: {body}")
+        except:
+            pass
         guardar_debug(driver, "login_timeout")
         return False
     except Exception as e:
@@ -186,13 +227,51 @@ def login(driver: uc.Chrome) -> bool:
 
 
 def esperar_captcha(driver: uc.Chrome) -> bool:
-    """Espera que el reCAPTCHA sea resuelto (automatica o manualmente)"""
-    print(f"[{timestamp()}] Esperando resolucion de reCAPTCHA...")
+    """Hace click en el reCAPTCHA y espera que se resuelva"""
+    print(f"[{timestamp()}] Resolviendo reCAPTCHA...")
 
+    # Paso 1: Hacer click en el checkbox "No soy un robot"
+    clicked = False
+    for intento in range(10):
+        try:
+            iframes = driver.find_elements(By.TAG_NAME, 'iframe')
+            for iframe in iframes:
+                src = iframe.get_attribute('src') or ''
+                if 'recaptcha' in src and 'anchor' in src:
+                    driver.switch_to.frame(iframe)
+                    try:
+                        checkbox = driver.find_element(By.ID, 'recaptcha-anchor')
+                        checkbox.click()
+                        clicked = True
+                        print(f"[{timestamp()}] Click en checkbox reCAPTCHA")
+                    except Exception:
+                        pass
+                    finally:
+                        driver.switch_to.default_content()
+                    if clicked:
+                        break
+            if clicked:
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+
+    if not clicked:
+        print(f"[{timestamp()}] WARN: No se pudo hacer click en el checkbox del captcha")
+
+    # Paso 2: Esperar que se resuelva
     inicio = time.time()
-    avisado = False
-
     while time.time() - inicio < CAPTCHA_TIMEOUT:
+        # Verificar si la pagina ya avanzo
+        try:
+            page_text = driver.find_element(By.TAG_NAME, 'body').text
+            if 'Cuentas de la persona' in page_text:
+                print(f"[{timestamp()}] Login ya completado")
+                return True
+        except:
+            pass
+
+        # Verificar g-recaptcha-response
         try:
             response = driver.find_element(By.ID, 'g-recaptcha-response')
             valor = response.get_attribute('value')
@@ -200,12 +279,27 @@ def esperar_captcha(driver: uc.Chrome) -> bool:
                 print(f"[{timestamp()}] reCAPTCHA resuelto!")
                 return True
         except NoSuchElementException:
-            # Si no hay captcha, quizas undetected-chromedriver lo evito
-            return True
+            if 'portalloginsinregistro' not in driver.current_url.lower():
+                return True
 
-        if not avisado and time.time() - inicio > 5:
-            print(f"[{timestamp()}] >> Resuelve el captcha en el navegador (timeout: {CAPTCHA_TIMEOUT}s)")
-            avisado = True
+        # Verificar checkbox marcado dentro del iframe
+        try:
+            iframes = driver.find_elements(By.TAG_NAME, 'iframe')
+            for iframe in iframes:
+                src = iframe.get_attribute('src') or ''
+                if 'recaptcha' in src and 'anchor' in src:
+                    driver.switch_to.frame(iframe)
+                    try:
+                        driver.find_element(By.CLASS_NAME, 'recaptcha-checkbox-checked')
+                        driver.switch_to.default_content()
+                        print(f"[{timestamp()}] reCAPTCHA checkbox marcado!")
+                        return True
+                    except NoSuchElementException:
+                        pass
+                    finally:
+                        driver.switch_to.default_content()
+        except:
+            pass
 
         time.sleep(2)
 
@@ -218,6 +312,9 @@ def esperar_captcha(driver: uc.Chrome) -> bool:
 def extraer_persona(driver: uc.Chrome) -> Persona:
     """Extrae informacion de la persona y sus cuentas"""
     print(f"[{timestamp()}] Extrayendo datos de la persona...")
+
+    # Guardar HTML post-login para debug
+    guardar_debug(driver, "post_login")
 
     usuario = ""
     persona_id = ""
@@ -275,42 +372,42 @@ def extraer_persona(driver: uc.Chrome) -> Persona:
 
 
 def extraer_cuentas_tabla(driver: uc.Chrome) -> List[Cuenta]:
-    """Extrae las cuentas de la tabla de la pagina post-login"""
+    """Extrae las cuentas de la tabla GeneXus de la pagina post-login"""
     cuentas = []
 
     try:
-        # La tabla de GeneXus puede ser un <table> o divs con grid
-        # Intentar encontrar filas de tabla
-        filas = driver.find_elements(By.CSS_SELECTOR, 'table tr')
+        # Buscar filas de la grid GeneXus por su ID (GridwwContainerRow_XXXX)
+        filas = driver.find_elements(By.CSS_SELECTOR, 'tr[id^="GridwwContainerRow_"]')
 
-        # Filtrar filas de datos (excluir header)
-        filas_datos = []
         for fila in filas:
-            celdas = fila.find_elements(By.TAG_NAME, 'td')
-            if len(celdas) >= 3:
-                filas_datos.append(fila)
+            row_id = fila.get_attribute('data-gxrow') or ''  # "0001", "0002", etc.
 
-        for fila in filas_datos:
-            celdas = fila.find_elements(By.TAG_NAME, 'td')
-            textos = [c.text.strip() for c in celdas]
+            # Extraer datos usando los span IDs de GeneXus
+            try:
+                nro_text = driver.find_element(By.ID, f'span_vCUENTANRO_{row_id}').text.strip()
+                nro = int(nro_text) if nro_text.isdigit() else 0
+            except:
+                nro = 0
 
-            # Formato esperado: [Cta, Servicio, Domicilio, Estado, ...]
-            if len(textos) >= 4:
-                try:
-                    nro = int(textos[0]) if textos[0].isdigit() else 0
-                except ValueError:
-                    nro = 0
+            try:
+                servicio = driver.find_element(By.ID, f'span_vCUENTASRV_{row_id}').text.strip()
+            except:
+                servicio = ''
 
-                cuenta = Cuenta(
-                    nro=nro,
-                    servicio=textos[1],
-                    domicilio=textos[2],
-                    estado=textos[3]
-                )
-                cuentas.append(cuenta)
+            try:
+                domicilio = driver.find_element(By.ID, f'span_vCUENTADOM_{row_id}').text.strip()
+            except:
+                domicilio = ''
+
+            try:
+                estado = driver.find_element(By.ID, f'span_vSTSDSC_{row_id}').text.strip()
+            except:
+                estado = ''
+
+            cuenta = Cuenta(nro=nro, servicio=servicio, domicilio=domicilio, estado=estado)
+            cuentas.append(cuenta)
 
         if not cuentas:
-            # Fallback: intentar parsear del texto de la pagina
             cuentas = extraer_cuentas_texto(driver)
 
     except Exception as e:
@@ -351,116 +448,121 @@ def extraer_detalle_cuenta(driver: uc.Chrome, cuenta: Cuenta, indice: int) -> Di
     detalle = {}
 
     try:
+        row_id = f"{indice + 1:04d}"  # "0001", "0002", etc.
+        img_id = f"vVERCUENTA_{row_id}"
+
         print(f"[{timestamp()}] Entrando al detalle de cuenta {cuenta.nro} ({cuenta.domicilio})...")
 
-        # Buscar el boton/icono de detalle en la fila correspondiente
-        filas = driver.find_elements(By.CSS_SELECTOR, 'table tr')
-        fila_target = None
-
-        for fila in filas:
-            celdas = fila.find_elements(By.TAG_NAME, 'td')
-            if celdas and celdas[0].text.strip() == str(cuenta.nro):
-                fila_target = fila
-                break
-
-        if not fila_target:
-            # Intentar por indice
-            filas_datos = [f for f in filas if f.find_elements(By.TAG_NAME, 'td')]
-            if indice < len(filas_datos):
-                fila_target = filas_datos[indice]
-
-        if fila_target:
-            # Buscar link o boton clickeable en la fila
-            clickeable = (
-                fila_target.find_elements(By.TAG_NAME, 'a') or
-                fila_target.find_elements(By.CSS_SELECTOR, 'input[type="image"], input[type="button"]') or
-                fila_target.find_elements(By.CSS_SELECTOR, 'img[onclick], span[onclick]')
+        # Click en el icono de detalle usando JavaScript (evita error de JS world)
+        try:
+            driver.execute_script(
+                f"document.getElementById('{img_id}').click();"
             )
+        except Exception:
+            # Fallback: buscar por selector
+            img = driver.find_element(By.ID, img_id)
+            driver.execute_script("arguments[0].click();", img)
 
-            if clickeable:
-                clickeable[0].click()
-                time.sleep(4)
+        time.sleep(5)
 
-                # Extraer todo el contenido de la pagina de detalle
-                detalle = parsear_pagina_detalle(driver)
+        # Verificar que la pagina cambio
+        current_url = driver.current_url
+        if 'cuentasselecion' in current_url.lower():
+            # La pagina no cambio, intentar con evento GeneXus
+            driver.execute_script(
+                f"gx.evt.execEvt('',false,\"E'VER_CUENTA'.{row_id}\",document.getElementById('{img_id}'));"
+            )
+            time.sleep(5)
 
-                # Volver a la lista de cuentas
-                volver_a_cuentas(driver)
-            else:
-                print(f"[{timestamp()}] WARN: No se encontro boton de detalle para cuenta {cuenta.nro}")
-        else:
-            print(f"[{timestamp()}] WARN: No se encontro fila para cuenta {cuenta.nro}")
+        # Extraer todo el contenido de la pagina de detalle
+        detalle = parsear_pagina_detalle(driver)
+
+        # Guardar debug de la pagina de detalle
+        guardar_debug(driver, f"detalle_cuenta_{cuenta.nro}")
+
+        # Volver a la lista de cuentas
+        volver_a_cuentas(driver)
 
     except Exception as e:
         print(f"[{timestamp()}] ERROR extrayendo detalle cuenta {cuenta.nro}: {e}")
-        guardar_debug(driver, f"detalle_cuenta_{cuenta.nro}")
+        guardar_debug(driver, f"error_detalle_cuenta_{cuenta.nro}")
 
     return detalle
 
 
 def parsear_pagina_detalle(driver: uc.Chrome) -> Dict:
-    """Parsea la pagina de detalle de una cuenta, extrayendo toda la info disponible"""
+    """Parsea la pagina de detalle de una cuenta usando IDs GeneXus"""
     detalle = {}
 
     try:
         time.sleep(2)
+
+        # Encabezado: Asociado, Domicilio, Detalle deuda
+        for campo_id, campo_nombre in [
+            ('LBLTEXTOENCABEZADO1', 'asociado'),
+            ('LBLTEXTOENCABEZADO2', 'domicilio'),
+            ('LBLTEXTOENCABEZADO3', 'periodo_deuda'),
+        ]:
+            try:
+                elem = driver.find_element(By.ID, campo_id)
+                texto = elem.text.strip()
+                if texto:
+                    # Limpiar prefijos como "Asociado: ", "Domicilio: "
+                    if ':' in texto and campo_nombre != 'periodo_deuda':
+                        texto = texto.split(':', 1)[-1].strip()
+                    detalle[campo_nombre] = texto
+            except NoSuchElementException:
+                pass
+
+        # Resumen pie: comprobantes adeudados e importe
+        try:
+            pie = driver.find_element(By.ID, 'LBLTEXTOPIE1').text.strip()
+            if pie:
+                detalle['resumen'] = pie
+                # Extraer importe adeudado
+                match_importe = re.search(r'Importe\s*Adeudado:\s*\$?([\d.,]+)', pie)
+                if match_importe:
+                    detalle['importe_adeudado'] = match_importe.group(1)
+                # Extraer cantidad
+                match_cant = re.search(r'Cant\.\s*comprobantes\s*adeudados:\s*(\d+)', pie)
+                if match_cant:
+                    detalle['comprobantes_adeudados'] = int(match_cant.group(1))
+        except NoSuchElementException:
+            pass
+
+        # Verificar si dice SIN COMPROBANTES PENDIENTES
         body_text = driver.find_element(By.TAG_NAME, 'body').text
+        if 'SIN COMPROBANTES PENDIENTES' in body_text:
+            detalle['estado_deuda'] = 'SIN COMPROBANTES PENDIENTES'
 
-        # Guardar texto completo para referencia
-        detalle['texto_completo'] = body_text
+        # Tabla de comprobantes (GridwwContainerTbl)
+        comprobantes = []
+        filas = driver.find_elements(By.CSS_SELECTOR, 'tr[id^="GridwwContainerRow_"]')
+        for fila in filas:
+            row_id = fila.get_attribute('data-gxrow') or ''
+            comprobante = {}
 
-        # Extraer pares clave-valor comunes
-        patrones = {
-            'suministro': r'(?:SUMINISTRO|Suministro|N[°º]\s*Suministro)\s*[:\s]*(\S+)',
-            'medidor': r'(?:MEDIDOR|Medidor|N[°º]\s*Medidor)\s*[:\s]*(\S+)',
-            'tarifa': r'(?:TARIFA|Tarifa|Categoria)\s*[:\s]*(.+?)(?:\n|$)',
-            'estado': r'(?:ESTADO|Estado)\s*[:\s]*(\S+)',
-            'direccion': r'(?:DIRECCI[OÓ]N|Direcci[oó]n|Domicilio)\s*[:\s]*(.+?)(?:\n|$)',
-            'localidad': r'(?:LOCALIDAD|Localidad|Ciudad)\s*[:\s]*(.+?)(?:\n|$)',
-            'ultima_lectura': r'(?:[UÚ]ltima\s*Lectura|LECTURA)\s*[:\s]*(.+?)(?:\n|$)',
-            'proximo_vencimiento': r'(?:Pr[oó]ximo\s*Vencimiento|VENCIMIENTO)\s*[:\s]*(.+?)(?:\n|$)',
-        }
+            campos_comprobante = [
+                (f'span_vCOLUMNA2_{row_id}', 'fecha_emision'),
+                (f'span_vCOLUMNA5_{row_id}', 'fecha_vencimiento'),
+                (f'span_vCOLUMNA3_{row_id}', 'comprobante'),
+                (f'span_vIMPORTEC_{row_id}', 'importe'),
+                (f'span_vCOLUMNA10_{row_id}', 'estado'),
+            ]
 
-        for key, patron in patrones.items():
-            match = re.search(patron, body_text, re.IGNORECASE)
-            if match:
-                detalle[key] = match.group(1).strip()
+            for span_id, nombre in campos_comprobante:
+                try:
+                    val = driver.find_element(By.ID, span_id).text.strip()
+                    if val:
+                        comprobante[nombre] = val
+                except NoSuchElementException:
+                    pass
 
-        # Buscar importes/deuda
-        importes = re.findall(r'\$\s*[\d.,]+', body_text)
-        if importes:
-            detalle['importes_encontrados'] = importes
+            if comprobante:
+                comprobantes.append(comprobante)
 
-        # Buscar tablas de detalle (facturas, consumos, etc.)
-        tablas = driver.find_elements(By.TAG_NAME, 'table')
-        for idx, tabla in enumerate(tablas):
-            filas = tabla.find_elements(By.TAG_NAME, 'tr')
-            if len(filas) > 1:  # tabla con datos
-                tabla_data = []
-                headers = []
-
-                # Extraer headers
-                ths = filas[0].find_elements(By.TAG_NAME, 'th')
-                if ths:
-                    headers = [th.text.strip() for th in ths]
-
-                # Extraer filas de datos
-                for fila in filas:
-                    celdas = fila.find_elements(By.TAG_NAME, 'td')
-                    if celdas:
-                        fila_data = [c.text.strip() for c in celdas]
-                        if any(fila_data):  # ignorar filas vacias
-                            if headers and len(headers) == len(fila_data):
-                                tabla_data.append(dict(zip(headers, fila_data)))
-                            else:
-                                tabla_data.append(fila_data)
-
-                if tabla_data:
-                    detalle[f'tabla_{idx}'] = tabla_data
-
-        # Limpiar texto_completo si hay otros datos
-        if len(detalle) > 1:
-            del detalle['texto_completo']
+        if comprobantes:
+            detalle['comprobantes'] = comprobantes
 
     except Exception as e:
         detalle['error'] = str(e)
@@ -469,21 +571,14 @@ def parsear_pagina_detalle(driver: uc.Chrome) -> Dict:
 
 
 def volver_a_cuentas(driver: uc.Chrome):
-    """Intenta volver a la pagina de cuentas"""
+    """Vuelve a la pagina de cuentas usando el boton BTNBACK"""
     try:
-        # Buscar link/boton de volver
-        volver = (
-            driver.find_elements(By.XPATH, "//a[contains(text(),'Volver')]") or
-            driver.find_elements(By.XPATH, "//input[contains(@value,'Volver')]") or
-            driver.find_elements(By.XPATH, "//a[contains(text(),'Cuentas')]")
-        )
-        if volver:
-            volver[0].click()
-            time.sleep(3)
-            return
-
-        # Fallback: navegar atras
-        driver.back()
+        # Usar boton Volver de GeneXus
+        try:
+            driver.execute_script("document.getElementById('BTNBACK').click();")
+        except Exception:
+            btn = driver.find_element(By.ID, 'BTNBACK')
+            btn.click()
         time.sleep(3)
 
         # Verificar que estamos en la pagina de cuentas
@@ -526,22 +621,34 @@ def imprimir_reporte(persona: Persona):
     # Detalle de cada cuenta
     for c in persona.cuentas:
         if c.detalle:
+            d = c.detalle
             print(f"\n{'─' * 70}")
             print(f"  DETALLE CUENTA {c.nro} - {c.domicilio}")
             print(f"{'─' * 70}")
-            for key, valor in c.detalle.items():
-                if key.startswith('tabla_'):
-                    print(f"\n  {key}:")
-                    if isinstance(valor, list):
-                        for item in valor:
-                            if isinstance(item, dict):
-                                for k, v in item.items():
-                                    print(f"    {k}: {v}")
-                                print()
-                            else:
-                                print(f"    {item}")
-                else:
-                    print(f"  {key}: {valor}")
+
+            if d.get('asociado'):
+                print(f"  Asociado: {d['asociado']}")
+            if d.get('domicilio'):
+                print(f"  Domicilio: {d['domicilio']}")
+            if d.get('periodo_deuda'):
+                print(f"  {d['periodo_deuda']}")
+
+            if d.get('estado_deuda'):
+                print(f"\n  [OK] {d['estado_deuda']}")
+            elif d.get('comprobantes_adeudados'):
+                print(f"\n  [!] Comprobantes adeudados: {d['comprobantes_adeudados']}")
+                if d.get('importe_adeudado'):
+                    print(f"  [!] Importe adeudado: ${d['importe_adeudado']}")
+
+            if d.get('comprobantes'):
+                print(f"\n  {'Fecha Emis.':<12} {'Fecha Vto.':<12} {'Comprobante':<25} {'Importe':>12} {'Estado':<10}")
+                print(f"  {'-' * 73}")
+                for comp in d['comprobantes']:
+                    print(f"  {comp.get('fecha_emision', ''):.<12} "
+                          f"{comp.get('fecha_vencimiento', ''):<12} "
+                          f"{comp.get('comprobante', ''):<25} "
+                          f"{comp.get('importe', ''):>12} "
+                          f"{comp.get('estado', ''):<10}")
 
     print("\n" + "=" * 70)
 
@@ -574,22 +681,32 @@ def exportar_csv(persona: Persona, archivo: str):
         # --- SECCION: DETALLE POR CUENTA ---
         for c in persona.cuentas:
             if c.detalle:
+                d = c.detalle
                 w.writerow([f'DETALLE CUENTA {c.nro} - {c.domicilio}'])
-                for key, valor in c.detalle.items():
-                    if key.startswith('tabla_') and isinstance(valor, list):
-                        # Escribir tabla
-                        w.writerow([f'  {key}'])
-                        for item in valor:
-                            if isinstance(item, dict):
-                                if not any(k == list(item.keys())[0] for row in [] for k in row):
-                                    w.writerow(list(item.keys()))
-                                w.writerow(list(item.values()))
-                            elif isinstance(item, list):
-                                w.writerow(item)
-                    elif key == 'importes_encontrados' and isinstance(valor, list):
-                        w.writerow([key, ' | '.join(valor)])
-                    else:
-                        w.writerow([key, valor])
+                if d.get('asociado'):
+                    w.writerow(['Asociado', d['asociado']])
+                if d.get('domicilio'):
+                    w.writerow(['Domicilio', d['domicilio']])
+                if d.get('periodo_deuda'):
+                    w.writerow(['Periodo', d['periodo_deuda']])
+                if d.get('estado_deuda'):
+                    w.writerow(['Estado Deuda', d['estado_deuda']])
+                if d.get('comprobantes_adeudados') is not None:
+                    w.writerow(['Comprobantes Adeudados', d['comprobantes_adeudados']])
+                if d.get('importe_adeudado'):
+                    w.writerow(['Importe Adeudado', d['importe_adeudado']])
+                w.writerow([])
+
+                if d.get('comprobantes'):
+                    w.writerow(['Fecha Emision', 'Fecha Vencimiento', 'Comprobante', 'Importe', 'Estado'])
+                    for comp in d['comprobantes']:
+                        w.writerow([
+                            comp.get('fecha_emision', ''),
+                            comp.get('fecha_vencimiento', ''),
+                            comp.get('comprobante', ''),
+                            comp.get('importe', ''),
+                            comp.get('estado', ''),
+                        ])
                 w.writerow([])
 
     print(f"[{timestamp()}] CSV exportado: {ruta.resolve()}")

@@ -5,9 +5,10 @@ Scraper automatizado para obtener informacion de cuentas de energia desde el Por
 ## Funcionalidades
 
 - Login automatico en el Portal de Clientes (sin password, solo tipo y numero de documento)
-- Manejo de reCAPTCHA v2 con `undetected-chromedriver` (bypass automatico o resolucion manual)
+- Manejo de reCAPTCHA v2 con `undetected-chromedriver` (bypass automatico con perfil persistente)
 - **Extraccion de cuentas**: numero, servicio, domicilio, estado de conexion
-- **Detalle de cada cuenta**: suministro, medidor, tarifa, lecturas, importes, tablas de datos
+- **Detalle de cada cuenta**: asociado, domicilio completo, comprobantes pendientes (fecha emision, vencimiento, numero, importe, estado)
+- **Deteccion de deuda**: cantidad de comprobantes adeudados e importe total
 - **Exportacion CSV** automatica (nombre basado en tipo y numero de ID)
 - Exportacion JSON para integracion con otros sistemas
 - Guardado de screenshots y HTML de debug ante errores
@@ -59,7 +60,7 @@ python calf_scraper.py
 ```
 
 Esto genera:
-- Reporte en consola con todas las cuentas y sus detalles
+- Reporte completo en consola (cuentas, detalle de deuda, comprobantes)
 - Archivo CSV automatico: `calf_<tipo>_<numero>.csv` (ej: `calf_4_189163.csv`)
 
 ### Salida JSON
@@ -72,17 +73,19 @@ python calf_scraper.py --json
 python calf_scraper.py --headless
 ```
 
-**Nota:** En modo headless el reCAPTCHA puede no resolverse automaticamente. Se recomienda modo visible (por defecto) para poder resolver el captcha manualmente si es necesario.
+**Nota:** En modo headless el reCAPTCHA puede no resolverse automaticamente. Se recomienda modo visible (por defecto) para la primera ejecucion.
 
 ## Manejo del reCAPTCHA
 
 El portal CALF usa reCAPTCHA v2. El scraper lo maneja asi:
 
 1. Abre Chrome con `undetected-chromedriver` (reduce deteccion de bots)
-2. Llena tipo de ID y numero automaticamente
-3. Si el captcha no se resuelve solo en 5 segundos, muestra: **"Resuelve el captcha en el navegador"**
-4. Tenes 120 segundos para hacer click en "No soy un robot" en la ventana de Chrome
-5. Una vez resuelto, el script continua automaticamente
+2. Usa un **perfil de Chrome persistente** (`chrome_profile/`) para mantener cookies entre ejecuciones
+3. Llena tipo de ID y numero automaticamente (via JavaScript para compatibilidad con GeneXus)
+4. Hace click automaticamente en el checkbox "No soy un robot"
+5. Si el captcha se resuelve sin desafio de imagenes, continua automaticamente
+6. Si aparece desafio de imagenes (primera ejecucion o muchos intentos), hay 120 segundos para resolverlo manualmente
+7. Las cookies quedan guardadas en el perfil, por lo que las siguientes ejecuciones pasan sin captcha
 
 ## Salida de ejemplo
 
@@ -90,7 +93,7 @@ El portal CALF usa reCAPTCHA v2. El scraper lo maneja asi:
 ======================================================================
             REPORTE DE CUENTAS - CALF ENERGIA
 ======================================================================
-Fecha del reporte: 10/02/2026 15:30
+Fecha del reporte: 10/02/2026 22:57
 Nombre: PEREZ JUAN
 Usuario: 10900123456000012
 Persona: 123456
@@ -106,10 +109,25 @@ Cuentas encontradas: 2
 ----------------------------------------------------------------------
   DETALLE CUENTA 1 - CALLE EJEMPLO 1234 NEUQUEN
 ----------------------------------------------------------------------
-  suministro: 12345678
-  medidor: 98765
-  tarifa: T1R
-  ...
+  Asociado: 123456/1: PEREZ JUAN
+  Domicilio: CALLE EJEMPLO N°1234 S.C
+  Detalle de deuda desde el 10/02/25
+
+  [OK] SIN COMPROBANTES PENDIENTES
+
+----------------------------------------------------------------------
+  DETALLE CUENTA 2 - OTRA CALLE 567 NEUQUEN
+----------------------------------------------------------------------
+  Asociado: 123456/2: PEREZ JUAN
+  Domicilio: OTRA CALLE N°567
+  Detalle de deuda desde el 10/02/25
+
+  [!] Comprobantes adeudados: 1
+  [!] Importe adeudado: $52630.39
+
+  Fecha Emis.  Fecha Vto.   Comprobante                    Importe Estado
+  -------------------------------------------------------------------------
+  20/01/26     06/02/26     FACT B-0021-20159538         52.630,39 Impaga
 
 ======================================================================
 ```
@@ -122,7 +140,8 @@ El CSV contiene las siguientes secciones:
 |---------|-----------|
 | DATOS DE LA PERSONA | Nombre, usuario, persona ID |
 | CUENTAS | Tabla con todas las cuentas (nro, servicio, domicilio, estado) |
-| DETALLE CUENTA N | Detalle de cada cuenta (suministro, medidor, tarifa, importes, tablas) |
+| DETALLE CUENTA N | Asociado, domicilio, estado de deuda, comprobantes adeudados, importe |
+| COMPROBANTES | Fecha emision, fecha vencimiento, numero comprobante, importe, estado |
 
 El archivo usa `;` como separador y encoding UTF-8 con BOM para compatibilidad con Excel.
 
@@ -135,7 +154,8 @@ calf-scraper/
 ├── .gitignore         # Archivos ignorados por Git
 ├── README.md          # Este archivo
 ├── requirements.txt   # Dependencias Python
-└── calf_scraper.py    # Script principal
+├── calf_scraper.py    # Script principal
+└── chrome_profile/    # Perfil Chrome persistente (NO se sube al repo)
 ```
 
 ## Solucion de problemas
@@ -143,14 +163,14 @@ calf-scraper/
 ### Error: "Falta CALF_NRO_ID"
 Verificar que existe el archivo `.env` con la variable `CALF_NRO_ID` configurada.
 
-### El captcha no se resuelve automaticamente
-Ejecutar sin `--headless` para poder resolver el captcha manualmente en la ventana de Chrome.
+### El captcha muestra desafio de imagenes
+Esto ocurre normalmente en la primera ejecucion o despues de muchos intentos. Resolver manualmente una vez; las cookies se guardan en `chrome_profile/` para las siguientes ejecuciones.
 
 ### Error de Chrome/ChromeDriver
 Asegurarse de tener Google Chrome instalado. `undetected-chromedriver` descarga automaticamente el ChromeDriver compatible.
 
-### Datos de detalle vacios
-La primera vez que se ejecuta, el extractor de detalle es generico. Si una pagina de detalle no se parsea bien, se guardan screenshots y HTML en la carpeta `debug/` para poder ajustar los selectores.
+### Error "session not created: This version of ChromeDriver only supports Chrome version X"
+Si la version de Chrome no coincide con el ChromeDriver, ajustar el parametro `version_main` en la funcion `crear_driver()` del script.
 
 ## Licencia
 
