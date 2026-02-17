@@ -3,10 +3,11 @@ Scraper para CALF - Portal de Clientes
 (Cooperativa de Agua, Luz y Fuerza de Neuquen)
 
 Obtiene cuentas de energia y detalle de cada cuenta.
+Resuelve reCAPTCHA automaticamente via CapSolver.
 
 Uso:
-    python calf_scraper.py                (navegador visible, reporte consola + CSV)
-    python calf_scraper.py --headless     (sin abrir navegador)
+    python calf_scraper.py                (headless, automatico)
+    python calf_scraper.py --no-headless  (navegador visible, para debug)
     python calf_scraper.py --json         (salida en formato JSON)
 """
 
@@ -16,6 +17,7 @@ import json
 import csv
 import sys
 import os
+import requests
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Optional
@@ -38,9 +40,15 @@ load_dotenv(env_path)
 URL = "https://sixon.com.ar/PortalClientes_CALF_PROD/servlet/com.portalclientes.portalloginsinregistro"
 TIPO_ID = os.getenv("CALF_TIPO_ID", "4")   # 1=DNI, 2=CUIT, 4=SOCIO
 NRO_ID = os.getenv("CALF_NRO_ID")
+CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY")
+RECAPTCHA_SITE_KEY = "6LeIPuYUAAAAAP4Z8B95v28B1rJWz_kPxmhiO4tc"
 
 if not NRO_ID:
     print("ERROR: Falta CALF_NRO_ID en archivo .env")
+    sys.exit(1)
+
+if not CAPSOLVER_API_KEY:
+    print("ERROR: Falta CAPSOLVER_API_KEY en archivo .env")
     sys.exit(1)
 
 CAPTCHA_TIMEOUT = 120  # segundos para resolver captcha
@@ -226,84 +234,122 @@ def login(driver: uc.Chrome) -> bool:
         return False
 
 
-def esperar_captcha(driver: uc.Chrome) -> bool:
-    """Hace click en el reCAPTCHA y espera que se resuelva"""
-    print(f"[{timestamp()}] Resolviendo reCAPTCHA...")
+def resolver_captcha_capsolver() -> Optional[str]:
+    """Resuelve reCAPTCHA v2 usando la API de CapSolver"""
+    print(f"[{timestamp()}] Enviando reCAPTCHA a CapSolver...")
 
-    # Paso 1: Hacer click en el checkbox "No soy un robot"
-    clicked = False
-    for intento in range(10):
-        try:
-            iframes = driver.find_elements(By.TAG_NAME, 'iframe')
-            for iframe in iframes:
-                src = iframe.get_attribute('src') or ''
-                if 'recaptcha' in src and 'anchor' in src:
-                    driver.switch_to.frame(iframe)
-                    try:
-                        checkbox = driver.find_element(By.ID, 'recaptcha-anchor')
-                        checkbox.click()
-                        clicked = True
-                        print(f"[{timestamp()}] Click en checkbox reCAPTCHA")
-                    except Exception:
-                        pass
-                    finally:
-                        driver.switch_to.default_content()
-                    if clicked:
-                        break
-            if clicked:
-                break
-        except Exception:
-            pass
-        time.sleep(1)
+    # Paso 1: Crear tarea
+    payload = {
+        "clientKey": CAPSOLVER_API_KEY,
+        "task": {
+            "type": "ReCaptchaV2TaskProxyLess",
+            "websiteURL": URL,
+            "websiteKey": RECAPTCHA_SITE_KEY,
+        }
+    }
 
-    if not clicked:
-        print(f"[{timestamp()}] WARN: No se pudo hacer click en el checkbox del captcha")
+    try:
+        resp = requests.post("https://api.capsolver.com/createTask", json=payload, timeout=30)
+        data = resp.json()
 
-    # Paso 2: Esperar que se resuelva
-    inicio = time.time()
-    while time.time() - inicio < CAPTCHA_TIMEOUT:
-        # Verificar si la pagina ya avanzo
-        try:
-            page_text = driver.find_element(By.TAG_NAME, 'body').text
-            if 'Cuentas de la persona' in page_text:
-                print(f"[{timestamp()}] Login ya completado")
-                return True
-        except:
-            pass
+        if data.get("errorId", 1) != 0:
+            print(f"[{timestamp()}] ERROR CapSolver createTask: {data.get('errorDescription', data)}")
+            return None
 
-        # Verificar g-recaptcha-response
-        try:
-            response = driver.find_element(By.ID, 'g-recaptcha-response')
-            valor = response.get_attribute('value')
-            if valor and len(valor) > 10:
-                print(f"[{timestamp()}] reCAPTCHA resuelto!")
-                return True
-        except NoSuchElementException:
-            if 'portalloginsinregistro' not in driver.current_url.lower():
-                return True
+        task_id = data["taskId"]
+        print(f"[{timestamp()}] Tarea creada: {task_id}")
 
-        # Verificar checkbox marcado dentro del iframe
-        try:
-            iframes = driver.find_elements(By.TAG_NAME, 'iframe')
-            for iframe in iframes:
-                src = iframe.get_attribute('src') or ''
-                if 'recaptcha' in src and 'anchor' in src:
-                    driver.switch_to.frame(iframe)
-                    try:
-                        driver.find_element(By.CLASS_NAME, 'recaptcha-checkbox-checked')
-                        driver.switch_to.default_content()
-                        print(f"[{timestamp()}] reCAPTCHA checkbox marcado!")
-                        return True
-                    except NoSuchElementException:
-                        pass
-                    finally:
-                        driver.switch_to.default_content()
-        except:
-            pass
+    except Exception as e:
+        print(f"[{timestamp()}] ERROR conectando a CapSolver: {e}")
+        return None
 
+    # Paso 2: Esperar resultado (polling)
+    for intento in range(60):  # max ~120 seg
         time.sleep(2)
+        try:
+            resp = requests.post("https://api.capsolver.com/getTaskResult", json={
+                "clientKey": CAPSOLVER_API_KEY,
+                "taskId": task_id,
+            }, timeout=30)
+            result = resp.json()
 
-    return False
+            if result.get("status") == "ready":
+                token = result["solution"]["gRecaptchaResponse"]
+                print(f"[{timestamp()}] reCAPTCHA resuelto por CapSolver! (token: {token[:50]}...)")
+                return token
+
+            if result.get("errorId", 0) != 0:
+                print(f"[{timestamp()}] ERROR CapSolver: {result.get('errorDescription', result)}")
+                return None
+
+            # Aun procesando
+            if intento % 5 == 0:
+                print(f"[{timestamp()}] Esperando respuesta de CapSolver... ({intento * 2}s)")
+
+        except Exception as e:
+            print(f"[{timestamp()}] ERROR polling CapSolver: {e}")
+
+    print(f"[{timestamp()}] ERROR: Timeout esperando respuesta de CapSolver")
+    return None
+
+
+def esperar_captcha(driver: uc.Chrome) -> bool:
+    """Resuelve el reCAPTCHA usando CapSolver y lo inyecta en la pagina"""
+    print(f"[{timestamp()}] Resolviendo reCAPTCHA con CapSolver...")
+
+    token = resolver_captcha_capsolver()
+    if not token:
+        print(f"[{timestamp()}] ERROR: No se pudo resolver el captcha")
+        return False
+
+    # Inyectar el token en la pagina
+    try:
+        # Buscar el textarea g-recaptcha-response (puede estar oculto o no existir aun)
+        driver.execute_script("""
+            var token = arguments[0];
+            // Buscar textarea existente
+            var ta = document.querySelector('textarea[name="g-recaptcha-response"]')
+                  || document.getElementById('g-recaptcha-response');
+            if (!ta) {
+                // Crear el textarea si no existe
+                ta = document.createElement('textarea');
+                ta.id = 'g-recaptcha-response';
+                ta.name = 'g-recaptcha-response';
+                ta.style.display = 'none';
+                var container = document.getElementById('CAPTCHAContainerUC') || document.forms[0];
+                container.appendChild(ta);
+            }
+            ta.value = token;
+            ta.innerHTML = token;
+
+            // Intentar callback de reCAPTCHA
+            try {
+                if (typeof ___grecaptcha_cfg !== 'undefined' && ___grecaptcha_cfg.clients) {
+                    for (var key in ___grecaptcha_cfg.clients) {
+                        var c = ___grecaptcha_cfg.clients[key];
+                        // Recorrer propiedades buscando el callback
+                        function findCallback(obj, depth) {
+                            if (depth > 5 || !obj) return;
+                            for (var k in obj) {
+                                if (k === 'callback' && typeof obj[k] === 'function') {
+                                    obj[k](token);
+                                    return;
+                                }
+                                if (typeof obj[k] === 'object') findCallback(obj[k], depth + 1);
+                            }
+                        }
+                        findCallback(c, 0);
+                    }
+                }
+            } catch(e) {}
+        """, token)
+        print(f"[{timestamp()}] Token inyectado en la pagina")
+        time.sleep(1)
+        return True
+    except Exception as e:
+        print(f"[{timestamp()}] ERROR inyectando token: {e}")
+        guardar_debug(driver, "captcha_inject_error")
+        return False
 
 
 # ============================================================
@@ -622,9 +668,9 @@ def imprimir_reporte(persona: Persona):
     for c in persona.cuentas:
         if c.detalle:
             d = c.detalle
-            print(f"\n{'─' * 70}")
+            print(f"\n{'-' * 70}")
             print(f"  DETALLE CUENTA {c.nro} - {c.domicilio}")
-            print(f"{'─' * 70}")
+            print(f"{'-' * 70}")
 
             if d.get('asociado'):
                 print(f"  Asociado: {d['asociado']}")
@@ -716,7 +762,7 @@ def exportar_csv(persona: Persona, archivo: str):
 # MAIN
 # ============================================================
 def main():
-    headless = '--headless' in sys.argv
+    headless = '--no-headless' not in sys.argv
     output_json = '--json' in sys.argv
 
     # CSV: siempre se genera, nombre basado en el NRO_ID
